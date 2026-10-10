@@ -114,6 +114,7 @@ def test_initialize_copies_clean_base_once_and_reuses_verified_manifest(tmp_path
     helper = client.containers.runs[0]
     assert helper["image"] == BASE_REF
     assert helper["network_mode"] == "none"
+    assert helper["runtime"] == "runc"
     assert helper["user"] == "root"
     assert helper["remove"] is True
     assert helper["working_dir"] == "/"
@@ -241,6 +242,7 @@ def test_workspace_is_retained_by_default_and_deleted_only_explicitly(tmp_path):
     cleanup = client.containers.runs[-1]
     assert cleanup["image"] == BASE_REF
     assert cleanup["network_mode"] == "none"
+    assert cleanup["runtime"] == "runc"
     cleanup_target = cleanup["environment"]["RSI_INIT_TARGET"]
     assert cleanup["entrypoint"] == ["/bin/sh", "-c"]
     assert cleanup["cap_drop"] == ["ALL"]

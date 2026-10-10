@@ -37,6 +37,7 @@ from rsi_harness.models import (
     WorkQuiescence,
 )
 from rsi_harness.runtime.gpu import (
+    NON_INJECTING_RUNTIME,
     NVIDIA_VISIBLE_DEVICES_ENV,
     NVIDIA_VISIBLE_DEVICES_VOID,
     amd_container_device_nodes,
@@ -534,6 +535,8 @@ class DockerContainerRuntime:
             "cap_drop": ["NET_RAW"],
             "detach": True,
         }
+        if spec.gpu_allocation.vendor != "nvidia":
+            kwargs["runtime"] = NON_INJECTING_RUNTIME
         if amd_device_nodes:
             kwargs["devices"] = [f"{node}:{node}:rwm" for node in amd_device_nodes]
             # A non-root task user reaches the nodes through their owning groups.

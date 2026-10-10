@@ -17,6 +17,7 @@ from rsi_harness.errors import SetupError
 from rsi_harness.models import RunPlan
 from rsi_harness.runtime.durable import durable_mkdir, fsync_directory
 from rsi_harness.runtime.gpu import (
+    NON_INJECTING_RUNTIME,
     NVIDIA_VISIBLE_DEVICES_ENV,
     NVIDIA_VISIBLE_DEVICES_VOID,
 )
@@ -110,6 +111,7 @@ def delete_managed_workspace(
                     }
                 },
                 network_mode="none",
+                runtime=NON_INJECTING_RUNTIME,
                 privileged=False,
                 cap_drop=["ALL"],
                 cap_add=list(_HELPER_CAPABILITIES),
@@ -241,6 +243,7 @@ class WorkspaceManager:
                     }
                 },
                 network_mode="none",
+                runtime=NON_INJECTING_RUNTIME,
                 privileged=False,
                 cap_drop=["ALL"],
                 cap_add=list(_HELPER_CAPABILITIES),
@@ -292,6 +295,7 @@ class WorkspaceManager:
                     }
                 },
                 network_mode="none",
+                runtime=NON_INJECTING_RUNTIME,
                 privileged=False,
                 cap_drop=["ALL"],
                 cap_add=list(_HELPER_CAPABILITIES),

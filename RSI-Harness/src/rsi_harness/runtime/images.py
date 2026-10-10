@@ -27,6 +27,7 @@ from rsi_harness.models import (
 )
 from rsi_harness.runtime.docker import DockerContainerRuntime
 from rsi_harness.runtime.gpu import (
+    NON_INJECTING_RUNTIME,
     NVIDIA_VISIBLE_DEVICES_ENV,
     NVIDIA_VISIBLE_DEVICES_VOID,
 )
@@ -388,6 +389,7 @@ fi
                     NVIDIA_VISIBLE_DEVICES_ENV: NVIDIA_VISIBLE_DEVICES_VOID,
                 },
                 network_mode="none",
+                runtime=NON_INJECTING_RUNTIME,
                 labels=self._labels(task, "work"),
                 remove=True,
             )
@@ -397,6 +399,7 @@ fi
                 user=verifier_user,
                 environment={NVIDIA_VISIBLE_DEVICES_ENV: NVIDIA_VISIBLE_DEVICES_VOID},
                 network_mode="none",
+                runtime=NON_INJECTING_RUNTIME,
                 labels=self._labels(task, "judge"),
                 remove=True,
             )

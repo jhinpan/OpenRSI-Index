@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import textwrap
 import threading
 import time
@@ -19,6 +20,7 @@ from pathlib import Path
 import docker
 import pytest
 
+from rsi_harness.errors import SetupError
 from rsi_harness.integrations.rsi_loop import RSILoopAgentAdapter
 from rsi_harness.models import (
     AgentRunRequest,
@@ -87,7 +89,9 @@ PY
 """
 
 
-def _task(tmp_path: Path, image: str) -> Path:
+def _task(
+    tmp_path: Path, image: str, gpu_type: str | None, *, compose: bool = False
+) -> Path:
     task = tmp_path / "amd-gpu-run"
     (task / "environment").mkdir(parents=True)
     (task / "tests").mkdir()
@@ -103,7 +107,7 @@ def _task(tmp_path: Path, image: str) -> Path:
             os = "linux"
             workdir = "/workspace"
             gpus = 1
-            network_mode = "no-network"
+            {gpu_types}network_mode = "no-network"
 
             [agent]
             timeout_sec = 600
@@ -116,8 +120,15 @@ def _task(tmp_path: Path, image: str) -> Path:
             [metadata.rsi_harness.verifier]
             gpus = 1
             """
-        )
+        ).format(gpu_types=f'gpu_types = ["{gpu_type}"]\n' if gpu_type else "")
     )
+    if compose:
+        (task / "environment" / "docker-compose.yaml").write_text(
+            "services:\n  main:\n    build: .\n    deploy:\n      resources:\n"
+            "        reservations:\n          devices:\n"
+            "            - driver: nvidia\n              count: 1\n"
+            "              capabilities: [gpu]\n"
+        )
     (task / "environment" / "Dockerfile").write_text(
         f"FROM {image}\n\nRUN mkdir -p /workspace\nWORKDIR /workspace\n"
     )
@@ -125,6 +136,12 @@ def _task(tmp_path: Path, image: str) -> Path:
     (task / "tests" / "test.sh").write_text(VERIFIER)
     (task / "tests" / "test.sh").chmod(0o755)
     return task
+
+
+def _isa(device: GPUDevice) -> str:
+    match = re.search(r"\((gfx[0-9a-f]+)\)$", device.name)
+    assert match, device.name
+    return match.group(1)
 
 
 class ScriptedAgent(RSILoopAgentAdapter):
@@ -256,7 +273,7 @@ def test_amd_run_scores_on_exactly_the_allocated_gpus(
     try:
         result = services.run(
             RunRequest(
-                task_dir=_task(tmp_path, image).resolve(),
+                task_dir=_task(tmp_path, image, _isa(work_gpu)).resolve(),
                 agent_name="codex",
                 gpu_selectors=pool,
                 options=CompileOptions(
@@ -292,3 +309,51 @@ def test_amd_run_scores_on_exactly_the_allocated_gpus(
     finally:
         if result is not None:
             services.cleanup(result.run_id, delete_workspace=True)
+
+
+@pytest.mark.parametrize("declaration", ["no-gpu-types", "compose-nvidia"])
+def test_amd_host_refuses_tasks_that_do_not_ask_for_amd_gpus(
+    tmp_path: Path, declaration: str
+) -> None:
+    raw = os.environ.get("RSI_TEST_GPUS")
+    image = os.environ.get("RSI_TEST_ROCM_IMAGE")
+    if not raw or not image:
+        pytest.skip("set RSI_TEST_GPUS and RSI_TEST_ROCM_IMAGE")
+    inventory = host_gpu_inventory()
+    if not isinstance(inventory, AmdSmiInventory):
+        pytest.skip("host is not an AMD GPU host")
+    selector = raw.split(",")[0].strip()
+    device = next(
+        device
+        for device in inventory.list_devices()
+        if selector in (str(device.index), device.uuid)
+    )
+    task = (
+        _task(tmp_path, image, None)
+        if declaration == "no-gpu-types"
+        else _task(tmp_path, image, _isa(device), compose=True)
+    )
+    from rsi_harness.runtime.production import ProductionRuntimeServices
+
+    services = ProductionRuntimeServices(
+        data_root=tmp_path / "data",
+        logs_root=tmp_path / "logs",
+        docker_client=docker.from_env(),
+        rsi_loop_config=RSILoopConfig(),
+    )
+    message = (
+        "declare environment.gpu_types"
+        if declaration == "no-gpu-types"
+        else "Compose GPU reservation is NVIDIA-only"
+    )
+    with pytest.raises(SetupError, match=message):
+        services.run(
+            RunRequest(
+                task_dir=task.resolve(),
+                agent_name="codex",
+                gpu_selectors=(selector,),
+                options=CompileOptions(
+                    agent_name="codex", primary_reward="reward", max_submissions=1
+                ),
+            )
+        )

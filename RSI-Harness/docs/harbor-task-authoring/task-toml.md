@@ -263,6 +263,8 @@ gpu_types = ["NVIDIA H100 NVL"]
   case-insensitively, in each device's name. NVIDIA names come from
   `nvidia-smi`. AMD names are the `amd-smi` market name followed by the ISA,
   such as `AMD Instinct MI355X (gfx950)`, so `MI355X` and `gfx950` both match.
+- Required for AMD GPUs: an AMD host refuses a GPU task that does not declare
+  a `gpu_types` value matching its GPUs.
 - Judge-specific GPU type selection is not currently supported.
 
 ### `workdir`

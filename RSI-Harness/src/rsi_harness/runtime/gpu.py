@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import stat
 import subprocess
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,14 @@ CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 NVIDIA_VISIBLE_DEVICES_ENV = "NVIDIA_VISIBLE_DEVICES"
 NVIDIA_VISIBLE_DEVICES_VOID = "void"
 _NVIDIA_GPU_UUID = re.compile(r"(?:GPU|MIG)-[A-Za-z0-9][A-Za-z0-9_.:/-]*\Z")
+# runc adds no devices of its own. An AMD container runtime set as the Docker
+# default adds every GPU that AMD_VISIBLE_DEVICES or any DOCKER_RESOURCE_*
+# variable names, and a container cannot unset an image's variables, so every
+# container without NVIDIA GPUs pins runc and AMD GPUs are passed as devices.
+NON_INJECTING_RUNTIME = "runc"
 AMD_KFD_DEVICE = Path("/dev/kfd")
 KFD_SYSFS_ROOT = Path("/sys/class/kfd/kfd")
+PROC_ROOT = Path("/proc")
 _PCI_BDF = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\Z")
 
 
@@ -94,9 +101,10 @@ class NvidiaSmiInventory:
 class AmdSmiInventory:
     """Read AMD GPUs from ``amd-smi`` and bind each to its KFD topology node.
 
-    ``amd-smi`` owns the operator-facing index, UUID, and model name; the KFD
-    topology owns the render node a container is given and the KFD GPU id that
-    process checks read. The two are joined by PCI address and must agree.
+    ``amd-smi`` owns the operator-facing index, UUID, and market name; the KFD
+    topology owns the ISA, the render node a container is given, and the KFD
+    GPU id that process checks read. The two are joined by PCI address and must
+    agree.
     """
 
     def __init__(
@@ -115,7 +123,7 @@ class AmdSmiInventory:
         asic = self._query(["amd-smi", "static", "--asic", "--json"])
         devices: list[GPUDevice] = []
         try:
-            names = _amd_device_names(asic)
+            markets = _amd_market_names(asic)
             nodes = _kfd_gpu_nodes_by_bdf(self._kfd_root)
             if not isinstance(listed, list):
                 raise ValueError("amd-smi list output is not a list")
@@ -133,17 +141,17 @@ class AmdSmiInventory:
                     raise ValueError(
                         f"GPU {index} at {bdf} matches {len(matches)} KFD nodes"
                     )
-                kfd_gpu_id, render_minor = matches[0]
+                kfd_gpu_id, render_minor, isa = matches[0]
                 render_node = self._dev_root / "dri" / f"renderD{render_minor}"
                 if not render_node.exists():
                     raise ValueError(f"render node {render_node} is missing")
-                if index not in names:
+                if index not in markets:
                     raise ValueError(f"amd-smi reported no ASIC data for GPU {index}")
                 devices.append(
                     GPUDevice(
                         index=index,
                         uuid=uuid,
-                        name=names[index],
+                        name=f"{markets[index]} ({isa})",
                         vendor="amd",
                         render_node=render_node,
                         kfd_gpu_id=kfd_gpu_id,
@@ -188,31 +196,37 @@ def _json_str(entry: object, key: str) -> str:
     return value.strip()
 
 
-def _amd_device_names(payload: object) -> dict[int, str]:
-    """Name each GPU by market name and ISA, e.g. ``AMD Instinct MI355X (gfx950)``.
+def _amd_market_names(payload: object) -> dict[int, str]:
+    """Market name per GPU index from ``amd-smi static --asic --json``.
 
-    The market name comes from a lookup table that differs between amd-smi
-    releases (one reports a MI355X as ``AMD Radeon Graphics``), so the ISA is
-    kept beside it and a task may require either.
+    ROCm 7 amd-smi wraps the GPU list in ``gpu_data``; ROCm 6.3 and 6.4 print
+    the bare list.
     """
-    entries = payload.get("gpu_data") if isinstance(payload, dict) else None
+    entries = payload.get("gpu_data") if isinstance(payload, dict) else payload
     if not isinstance(entries, list):
-        raise ValueError("amd-smi static output has no gpu_data list")
+        raise ValueError("amd-smi static output has no GPU list")
     names: dict[int, str] = {}
     for entry in entries:
         index = _json_int(entry, "gpu")
-        asic = entry.get("asic")
-        market = _json_str(asic, "market_name")
-        isa = _json_str(asic, "target_graphics_version")
         if index in names:
             raise ValueError(f"amd-smi static output repeats GPU {index}")
-        names[index] = f"{market} ({isa})"
+        names[index] = _json_str(entry.get("asic"), "market_name")
     return names
 
 
-def _kfd_gpu_nodes_by_bdf(kfd_root: Path) -> dict[str, tuple[tuple[int, int], ...]]:
-    """Map each PCI address to its KFD ``(gpu_id, drm_render_minor)`` nodes."""
-    found: dict[str, list[tuple[int, int]]] = {}
+_KFD_NODE_KEYS = {"domain", "location_id", "drm_render_minor", "gfx_target_version"}
+
+
+def _kfd_gpu_nodes_by_bdf(
+    kfd_root: Path,
+) -> dict[str, tuple[tuple[int, int, str], ...]]:
+    """Map each PCI address to its KFD ``(gpu_id, render minor, ISA)`` nodes.
+
+    GPUs are named "<market name> (<ISA>)", e.g. ``AMD Instinct MI355X
+    (gfx950)``, because the market-name table differs between amd-smi releases
+    (one names a MI355X ``AMD Radeon Graphics``); a task may require either.
+    """
+    found: dict[str, list[tuple[int, int, str]]] = {}
     for node in sorted((kfd_root / "topology" / "nodes").iterdir()):
         gpu_id = int((node / "gpu_id").read_text().strip())
         if gpu_id == 0:
@@ -220,9 +234,9 @@ def _kfd_gpu_nodes_by_bdf(kfd_root: Path) -> dict[str, tuple[tuple[int, int], ..
         properties: dict[str, int] = {}
         for line in (node / "properties").read_text().splitlines():
             key, _, value = line.partition(" ")
-            if key in {"domain", "location_id", "drm_render_minor"}:
+            if key in _KFD_NODE_KEYS:
                 properties[key] = int(value)
-        missing = {"domain", "location_id", "drm_render_minor"} - properties.keys()
+        missing = _KFD_NODE_KEYS - properties.keys()
         if missing:
             raise ValueError(f"KFD node {node.name} lacks {sorted(missing)[0]}")
         location = properties["location_id"]
@@ -232,7 +246,9 @@ def _kfd_gpu_nodes_by_bdf(kfd_root: Path) -> dict[str, tuple[tuple[int, int], ..
         )
         if _PCI_BDF.fullmatch(bdf) is None:
             raise ValueError(f"KFD node {node.name} has an invalid PCI address")
-        found.setdefault(bdf, []).append((gpu_id, properties["drm_render_minor"]))
+        version = properties["gfx_target_version"]
+        isa = f"gfx{version // 10000}{version // 100 % 100}{version % 100:x}"
+        found.setdefault(bdf, []).append((gpu_id, properties["drm_render_minor"], isa))
     return {bdf: tuple(entries) for bdf, entries in found.items()}
 
 
@@ -263,6 +279,27 @@ def host_gpu_inventory(
     ):
         return AmdSmiInventory()
     return NvidiaSmiInventory()
+
+
+def require_amd_task_declaration(
+    requirement: GPURequirement,
+    plan: RunGPUPlan,
+    *,
+    compose_gpu_reservation: bool,
+) -> None:
+    """Refuse to give AMD GPUs to a task that did not ask for them."""
+    if plan.authorized_pool.vendor != "amd":
+        return
+    if compose_gpu_reservation:
+        raise SetupError(
+            "the task's Compose GPU reservation is NVIDIA-only; declare AMD GPUs "
+            "with environment.gpus and environment.gpu_types instead"
+        )
+    if not requirement.name:
+        raise SetupError(
+            "AMD GPUs are given only to tasks that declare environment.gpu_types "
+            "matching them, for example MI355X or gfx950"
+        )
 
 
 def _resolve_authorized_pool(
@@ -522,17 +559,54 @@ def _amd_gpu_processes(
     return tuple(processes)
 
 
+def _amd_render_node_holders(
+    allocation: GPUAllocation, pids: Iterable[int], proc_root: Path
+) -> tuple[tuple[str, int], ...]:
+    """PIDs with an allocated render node open, KFD context or not.
+
+    libdrm, Vulkan, and other DRM clients use the render node without /dev/kfd,
+    so KFD contexts alone do not prove a GPU is released.
+    """
+    try:
+        devices = {
+            device.render_node.stat().st_rdev: device.uuid
+            for device in allocation.devices
+            if device.render_node is not None
+        }
+    except OSError as error:
+        raise SubmissionError(f"AMD render node is unavailable: {error}") from error
+    holders: list[tuple[str, int]] = []
+    for pid in pids:
+        try:
+            descriptors = tuple((proc_root / str(pid) / "fd").iterdir())
+        except FileNotFoundError:
+            continue  # the process exited
+        except OSError as error:
+            raise SubmissionError(
+                f"GPU process query is unavailable: {error}"
+            ) from error
+        for descriptor in descriptors:
+            try:
+                metadata = descriptor.stat()
+            except OSError:
+                continue  # the descriptor closed while being listed
+            if stat.S_ISCHR(metadata.st_mode) and metadata.st_rdev in devices:
+                holders.append((devices[metadata.st_rdev], pid))
+    return tuple(dict.fromkeys(holders))
+
+
 def assert_work_gpu_quiescent(
     allocation: GPUAllocation,
     work_container: Any,
     *,
     runner: CommandRunner = _run,
     kfd_root: Path = KFD_SYSFS_ROOT,
+    proc_root: Path = PROC_ROOT,
 ) -> None:
     """Reject only allocated-GPU processes owned by the Work container."""
     work_pids = _container_pids(work_container)
     assert_gpu_processes_quiescent(
-        allocation, work_pids, runner=runner, kfd_root=kfd_root
+        allocation, work_pids, runner=runner, kfd_root=kfd_root, proc_root=proc_root
     )
 
 
@@ -542,11 +616,14 @@ def assert_gpu_processes_quiescent(
     *,
     runner: CommandRunner = _run,
     kfd_root: Path = KFD_SYSFS_ROOT,
+    proc_root: Path = PROC_ROOT,
 ) -> None:
     """Check an explicitly attributed host PID set against allocated GPUs."""
     allocated = frozenset(allocation.uuids)
     if allocation.vendor == "amd":
-        processes = _amd_gpu_processes(allocation, kfd_root)
+        processes = _amd_gpu_processes(allocation, kfd_root) + _amd_render_node_holders(
+            allocation, sorted(work_pids), proc_root
+        )
     else:
         processes = _gpu_processes(runner, allocated)
     for uuid, pid in processes:
@@ -559,8 +636,10 @@ def assert_gpu_processes_quiescent(
 __all__ = [
     "AMD_KFD_DEVICE",
     "KFD_SYSFS_ROOT",
+    "NON_INJECTING_RUNTIME",
     "NVIDIA_VISIBLE_DEVICES_ENV",
     "NVIDIA_VISIBLE_DEVICES_VOID",
+    "PROC_ROOT",
     "AmdSmiInventory",
     "NvidiaSmiInventory",
     "amd_container_device_nodes",
@@ -568,6 +647,7 @@ __all__ = [
     "assert_work_gpu_quiescent",
     "host_gpu_inventory",
     "nvidia_visible_devices_value",
+    "require_amd_task_declaration",
     "resolve_allocation",
     "resolve_gpu_plan",
 ]

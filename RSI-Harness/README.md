@@ -150,19 +150,28 @@ Local Docker runs also support AMD Instinct GPUs. The host is treated as AMD
 when it has `amd-smi` and `/dev/kfd` but no `nvidia-smi`; otherwise the NVIDIA
 path is used unchanged.
 
-- `--gpus` accepts the indexes and UUIDs printed by `amd-smi list`.
+- `--gpus` accepts the indexes and UUIDs printed by `amd-smi list` (ROCm 6.3
+  and later; both the ROCm 6 and ROCm 7 JSON shapes are read).
 - Work and Judge each receive `/dev/kfd` and only the DRM render nodes of their
   allocated GPUs, plus the groups that own those nodes, so a non-root task user
   can open them. No privileges, capabilities, or NVIDIA runtime are involved.
+  Every container without NVIDIA GPUs, helpers included, runs under `runc`
+  as sandbox children already do, so an AMD container runtime set as the
+  Docker default cannot add the GPUs an image names in `AMD_VISIBLE_DEVICES`
+  or any `DOCKER_RESOURCE_*` variable.
 - The task image must provide the ROCm user space it needs (for example
   PyTorch for ROCm); nothing is injected from the host.
-- Declare GPUs in `task.toml` with `environment.gpus` and, when the task needs
-  a specific GPU, `gpu_types`. The Compose GPU reservation is NVIDIA-only.
-  A GPU's type is its `amd-smi` market name followed by its ISA, for example
-  `AMD Instinct MI355X (gfx950)`, so `gpu_types = ["MI355X"]` and
-  `gpu_types = ["gfx950"]` both match it.
-- Before release-all Judge reuse, Work processes holding a KFD context on an
-  allocated GPU block the submission, read from `/sys/class/kfd/kfd/proc`.
+- Declare GPUs in `task.toml` with `environment.gpus` and `gpu_types`. A GPU's
+  type is its `amd-smi` market name followed by its ISA from the KFD topology,
+  for example `AMD Instinct MI355X (gfx950)`, so `gpu_types = ["MI355X"]` and
+  `gpu_types = ["gfx950"]` both match it. AMD GPUs go only to tasks whose
+  `gpu_types` matches them: a GPU task without `gpu_types`, or with the
+  NVIDIA-only Compose GPU reservation, stops during setup. CPU Work with a GPU
+  Judge cannot declare `gpu_types` and is therefore unsupported on AMD.
+- Before release-all Judge reuse, a Work process blocks the submission if it
+  holds a KFD context on an allocated GPU (`/sys/class/kfd/kfd/proc`) or has an
+  allocated render node open, as libdrm and Vulkan clients do without
+  `/dev/kfd` (its `/proc/<pid>/fd`, which needs the root the run already has).
 - Only unpartitioned (SPX) GPUs are supported; a compute-partitioned GPU stops
   the run during setup.
 

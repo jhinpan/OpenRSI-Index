@@ -1,10 +1,11 @@
 """AMD allocation, container isolation, and Work quiescence on real GPUs.
 
-Run on an AMD host with an explicit pool and an image that ships ROCm's HIP
-runtime and Python, for example::
+Run as root (the release check reads Work processes' file descriptors, as
+``rsi-harness run`` does) on an AMD host with an explicit pool and an image
+that ships ROCm's HIP runtime and Python, for example::
 
-    RSI_TEST_GPUS=2,3 RSI_TEST_ROCM_IMAGE=rocm/pytorch:latest \
-        python -m pytest -m gpu tests/hardware/test_amd_gpu.py
+    sudo -E env RSI_TEST_GPUS=2,3 RSI_TEST_ROCM_IMAGE=rocm/pytorch:latest \
+        .venv/bin/python -m pytest -m gpu tests/hardware/test_amd_gpu.py
 """
 
 from __future__ import annotations
@@ -97,6 +98,8 @@ def _wait(condition: Callable[[], bool], what: str, seconds: float = 60.0) -> No
 
 @pytest.fixture
 def amd_allocation() -> GPUAllocation:
+    if os.geteuid() != 0:
+        pytest.skip("the release check reads other users' /proc fds; run as root")
     inventory = host_gpu_inventory()
     if not isinstance(inventory, AmdSmiInventory):
         pytest.skip("host is not an AMD GPU host")
@@ -199,6 +202,49 @@ def test_amd_container_reaches_exactly_its_gpus_and_blocks_release_until_idle(
             return True
 
         _wait(released, "the HIP holder to release its KFD context")
+
+        # A DRM client that opens only the render node, never /dev/kfd.
+        render = next(
+            device.render_node
+            for device in amd_allocation.devices
+            if device.render_node is not None
+        )
+        container.exec_run(
+            [
+                "python3",
+                "-c",
+                "import os, sys, time\n"
+                "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+                "open('/tmp/drm-ready', 'w').close()\n"
+                "while not os.path.exists('/tmp/drm-ready.stop'):\n"
+                "    time.sleep(0.1)\n",
+                str(render),
+            ],
+            user=TASK_USER,
+            detach=True,
+        )
+        _wait(
+            lambda: container.exec_run(["test", "-e", "/tmp/drm-ready"]).exit_code == 0,
+            "the render-node-only holder to open its device",
+        )
+        table = container.top(ps_args="-eo pid,args")
+        pid_column = table["Titles"].index("PID")
+        drm_pids = [
+            int(row[pid_column])
+            for row in table["Processes"]
+            if "drm-ready" in " ".join(row)
+        ]
+        assert drm_pids
+        # Only the render-node check can catch it: it holds no KFD context.
+        assert not any(
+            Path(f"/sys/class/kfd/kfd/proc/{pid}").exists() for pid in drm_pids
+        )
+        with pytest.raises(SubmissionError, match="is still active on"):
+            assert_work_gpu_quiescent(amd_allocation, container)
+        container.exec_run(["touch", "/tmp/drm-ready.stop"], user=TASK_USER)
+        _wait(released, "the render-node-only holder to exit")
+
+        assert container.attrs["HostConfig"]["Runtime"] == "runc"
     finally:
         for runtime, ref in reversed(created):
             runtime.stop(ref)

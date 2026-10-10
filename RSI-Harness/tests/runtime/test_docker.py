@@ -212,6 +212,7 @@ def test_create_gives_an_amd_allocation_only_its_device_nodes(tmp_path, monkeypa
     assert create["group_add"] == [str(kfd.stat().st_gid)]
     assert create["device_requests"] == []
     assert create["environment"]["NVIDIA_VISIBLE_DEVICES"] == "void"
+    assert create["runtime"] == "runc"
     assert create["privileged"] is False
 
 
@@ -369,6 +370,23 @@ def test_work_feedback_mount_is_attested_from_created_container(
 
     with pytest.raises(InfrastructureError, match="feedback mount attestation"):
         runtime.attest_work_feedback_mount(ref)
+
+
+@pytest.mark.parametrize(
+    ("gpu_allocation", "expected_runtime"),
+    ((allocation(), None), (GPUAllocation(), "runc")),
+)
+def test_create_pins_runc_unless_the_container_gets_nvidia_gpus(
+    tmp_path, gpu_allocation, expected_runtime
+):
+    """An AMD default runtime would add GPUs an image names in DOCKER_RESOURCE_*."""
+    client = FakeDockerClient()
+
+    make_runtime(client, tmp_path).create(
+        ContainerSpec(image="work", gpu_allocation=gpu_allocation)
+    )
+
+    assert client.containers.created[0].get("runtime") == expected_runtime
 
 
 @pytest.mark.parametrize(

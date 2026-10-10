@@ -63,6 +63,7 @@ from rsi_harness.runtime.gpu import (
     assert_work_gpu_quiescent,
     host_gpu_inventory,
     nvidia_visible_devices_value,
+    require_amd_task_declaration,
     resolve_gpu_plan,
 )
 from rsi_harness.runtime.images import DockerImageBuilder
@@ -1926,6 +1927,11 @@ class ProductionRuntimeServices:
             judge_count=definition.verifier.gpu_count,
             requested=request.gpu_selectors,
             inventory=self.inventory.list_devices() if needs_gpus else (),
+        )
+        require_amd_task_declaration(
+            definition.gpu_requirement,
+            gpu_plan,
+            compose_gpu_reservation=definition.service.gpu_requirement is not None,
         )
         preparation = RunPreparation(
             request=request,

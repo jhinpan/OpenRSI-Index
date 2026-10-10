@@ -11,9 +11,11 @@ from rsi_harness.models import GPUAllocation, GPUDevice, GPURequirement
 from rsi_harness.runtime.gpu import (
     AmdSmiInventory,
     NvidiaSmiInventory,
+    assert_gpu_processes_quiescent,
     assert_work_gpu_quiescent,
     host_gpu_inventory,
     nvidia_visible_devices_value,
+    require_amd_task_declaration,
     resolve_allocation,
     resolve_gpu_plan,
 )
@@ -396,21 +398,15 @@ def amd_smi_list(**overrides: object) -> str:
     return json.dumps(rows)
 
 
-def amd_smi_asic(market_name: str = "AMD Instinct MI355X") -> str:
-    return json.dumps(
-        {
-            "gpu_data": [
-                {
-                    "gpu": index,
-                    "asic": {
-                        "market_name": market_name,
-                        "target_graphics_version": "gfx950",
-                    },
-                }
-                for index in range(len(AMD_GPUS))
-            ]
-        }
-    )
+def amd_smi_asic(
+    market_name: str = "AMD Instinct MI355X", *, bare: bool = False
+) -> str:
+    """ROCm 7 amd-smi wraps the list in gpu_data; ROCm 6.3/6.4 print it bare."""
+    entries = [
+        {"gpu": index, "asic": {"market_name": market_name}}
+        for index in range(len(AMD_GPUS))
+    ]
+    return json.dumps(entries if bare else {"gpu_data": entries})
 
 
 def amd_host(tmp_path: Path, *, render_nodes: bool = True) -> tuple[Path, Path]:
@@ -427,6 +423,7 @@ def amd_host(tmp_path: Path, *, render_nodes: bool = True) -> tuple[Path, Path]:
             f"location_id {gpu['location_id']}\n"
             "domain 0\n"
             f"drm_render_minor {gpu['minor']}\n"
+            "gfx_target_version 90500\n"
         )
     (kfd_root / "proc").mkdir()
     dev_root = tmp_path / "dev"
@@ -540,11 +537,12 @@ def test_amd_quiescence_reads_kfd_contexts_of_work_pids_only(tmp_path):
         for gpu_id in gpu_ids:
             (process / f"vram_{gpu_id}").write_text("0\n")
     allocated = GPUAllocation(devices=(inventory[1],))
+    roots = {"kfd_root": kfd_root, "proc_root": tmp_path / "no-proc"}
 
     # 42 holds only an unallocated GPU and 43 belongs to another container.
-    assert_work_gpu_quiescent(allocated, TopContainer((42, 99)), kfd_root=kfd_root)
+    assert_work_gpu_quiescent(allocated, TopContainer((42, 99)), **roots)
     with pytest.raises(SubmissionError, match=r"PID 41 is still active"):
-        assert_work_gpu_quiescent(allocated, TopContainer((41,)), kfd_root=kfd_root)
+        assert_work_gpu_quiescent(allocated, TopContainer((41,)), **roots)
 
 
 def test_amd_quiescence_fails_closed_when_an_allocated_gpu_left_topology(tmp_path):
@@ -557,6 +555,7 @@ def test_amd_quiescence_fails_closed_when_an_allocated_gpu_left_topology(tmp_pat
             GPUAllocation(devices=(inventory[1],)),
             TopContainer((41,)),
             kfd_root=kfd_root,
+            proc_root=tmp_path / "no-proc",
         )
 
 
@@ -582,3 +581,88 @@ def test_host_inventory_keeps_nvidia_default_and_finds_amd(
     )
 
     assert type(inventory) is expected
+
+
+@pytest.mark.parametrize("bare", [False, True])
+def test_amd_inventory_reads_both_amd_smi_static_shapes(tmp_path, bare):
+    devices = amd_inventory(
+        tmp_path, amd_smi_list(), amd_smi_asic(bare=bare)
+    ).list_devices()
+
+    assert {device.name for device in devices} == {"AMD Instinct MI355X (gfx950)"}
+
+
+@pytest.mark.parametrize(
+    ("version", "isa"), [(90500, "gfx950"), (90402, "gfx942"), (90010, "gfx90a")]
+)
+def test_amd_isa_comes_from_the_kfd_gfx_target_version(tmp_path, version, isa):
+    inventory = amd_inventory(tmp_path, amd_smi_list())
+    for node in (tmp_path / "kfd" / "topology" / "nodes").iterdir():
+        properties = node / "properties"
+        properties.write_text(
+            properties.read_text().replace(
+                "gfx_target_version 90500", f"gfx_target_version {version}"
+            )
+        )
+
+    devices = inventory.list_devices()
+
+    assert devices[0].name == f"AMD Instinct MI355X ({isa})"
+
+
+def test_amd_quiescence_catches_render_node_users_without_kfd(tmp_path):
+    inventory = amd_inventory(tmp_path, amd_smi_list()).list_devices()
+    render_node = inventory[1].render_node
+    render_node.unlink()
+    render_node.symlink_to("/dev/null")
+    proc_root = tmp_path / "proc"
+    for pid, target in {41: "/dev/null", 42: "/dev/zero", 43: "/dev/null"}.items():
+        (proc_root / str(pid) / "fd").mkdir(parents=True)
+        (proc_root / str(pid) / "fd" / "3").symlink_to(target)
+    allocated = GPUAllocation(devices=(inventory[1],))
+    kfd_root = tmp_path / "kfd"
+
+    # 42 holds another character device, 43 is outside Work, 44 has exited.
+    assert_gpu_processes_quiescent(
+        allocated, frozenset({42, 44}), kfd_root=kfd_root, proc_root=proc_root
+    )
+    with pytest.raises(SubmissionError, match=r"PID 41 is still active"):
+        assert_gpu_processes_quiescent(
+            allocated, frozenset({41, 42}), kfd_root=kfd_root, proc_root=proc_root
+        )
+
+
+def test_amd_gpus_go_only_to_tasks_that_declare_them(tmp_path):
+    amd = amd_inventory(tmp_path, amd_smi_list()).list_devices()
+    amd_plan = resolve_gpu_plan(
+        GPURequirement(count=1), judge_count=1, requested=("1",), inventory=amd
+    )
+    nvidia_plan = resolve_gpu_plan(
+        GPURequirement(count=1),
+        judge_count=1,
+        requested=("GPU-a",),
+        inventory=eight_h100_inventory(),
+    )
+
+    with pytest.raises(SetupError, match="declare environment.gpu_types"):
+        require_amd_task_declaration(
+            GPURequirement(count=1), amd_plan, compose_gpu_reservation=False
+        )
+    with pytest.raises(SetupError, match="Compose GPU reservation is NVIDIA-only"):
+        require_amd_task_declaration(
+            GPURequirement(count=1, name="gfx950"),
+            amd_plan,
+            compose_gpu_reservation=True,
+        )
+    require_amd_task_declaration(
+        GPURequirement(count=1, name="gfx950"), amd_plan, compose_gpu_reservation=False
+    )
+    require_amd_task_declaration(
+        GPURequirement(count=1), nvidia_plan, compose_gpu_reservation=True
+    )
+    cpu_plan = resolve_gpu_plan(
+        GPURequirement(count=0), judge_count=0, requested=(), inventory=()
+    )
+    require_amd_task_declaration(
+        GPURequirement(count=0), cpu_plan, compose_gpu_reservation=False
+    )

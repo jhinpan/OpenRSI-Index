@@ -462,6 +462,7 @@ def test_dynamic_preflight_uses_phase_users_and_agent_home(tmp_path):
     assert judge["environment"] == {"NVIDIA_VISIBLE_DEVICES": "void"}
     assert work["network_mode"] == "none"
     assert judge["network_mode"] == "none"
+    assert work["runtime"] == judge["runtime"] == "runc"
     assert work["labels"]["rsi-harness.role"] == "work"
     assert judge["labels"]["rsi-harness.role"] == "judge"
     assert work["labels"]["rsi-harness.task-id"] == "minimal-gpu"
